@@ -1,193 +1,183 @@
+# === Standard Library Imports ===
 import asyncio
+import os
 import json
-import requests
-import logging
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
+import re
+from typing import List
+from datetime import datetime, timedelta
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('irctc_agent_automation.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# === Third-Party Library Imports ===
+from pydantic import BaseModel
+from browser_use import Controller, Agent
+from browser_use.browser.context import BrowserContextConfig
+from langchain_google_genai import ChatGoogleGenerativeAI
+from playwright.async_api import Page  # Add this import
 
-# Query Ollama's DeepSeek model
-def query_ollama(prompt: str, model: str = "deepseek-r1:8b") -> str:
-    base_url = "http://localhost:11434/api/chat"
+
+# === Pydantic Output Model for Browser Controller ===
+class TrainInfo(BaseModel):
+    train_number: str
+    train_name: str
+    departure: str
+    arrival: str
+    duration: str
+    fare: str
+    available: str
+
+
+class TrainAvailability(BaseModel):
+    source: str
+    destination: str
+    date: str
+    class_: str
+    trains: List[TrainInfo]
+
+
+# === Controller Setup ===
+controller = Controller(output_model=TrainAvailability)
+
+
+from playwright.async_api import Page
+
+@controller.action("Clicks the travel class dropdown and selects the given class (like 1A, 2A, 3A, SL).")
+async def select_travel_class(page: Page, class_name: str): 
     try:
-        response = requests.post(
-            base_url,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "options": {"seed": 101, "temperature": 0}
-            },
-            stream=True,
-            timeout=30
-        )
-        if response.status_code == 200:
-            message = ""
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        data = json.loads(line)
-                        content = data.get("message", {}).get("content", "")
-                        message += content
-                    except json.JSONDecodeError:
-                        logger.error(f"Failed to decode line: {line}")
-            logger.debug(f"Ollama response: {message}")
-            return message.strip()
-        else:
-            logger.error(f"Ollama request failed: {response.text}")
-            return ""
+        # Click the dropdown for travel class
+        await page.click("//div[contains(@class, 'ui-dropdown-trigger') and contains(@class, 'ui-state-default')]")
+
+        # Wait for the dropdown options to load
+        await page.wait_for_selector("//ul[@role='listbox']", timeout=3000)
+
+        # Locate the desired class using the provided XPath with contains()
+        class_option = await page.query_selector(f"//li[contains(@aria-label, '{class_name}')]")
+        if not class_option:
+            raise ValueError(f"Class '{class_name}' not found in the dropdown.")
+        
+        # Scroll into view and add a delay to ensure proper scrolling
+        await class_option.scroll_into_view_if_needed()
+        await asyncio.sleep(2)  # Add a 2-second delay for stability
+
+        # Click the desired class
+        await class_option.click()
+
+        print(f"✅ Successfully selected travel class: {class_name}")
     except Exception as e:
-        logger.error(f"Ollama error: {e}")
-        return ""
+        print(f"❌ Failed to select class '{class_name}': {e}")
 
-# Simple Playwright Agent
-async def deepseek_agent(task: str):
-    prompt = (
-        f"Task: {task}\n\n"
-        f"Website: https://www.irctc.co.in/nget/train-search\n\n"
-        f"Generate a sequence of Playwright actions to complete the task. "
-        f"Return a JSON object with an 'actions' array, where each action has: "
-        f"'instruction' (description), 'action' (e.g., 'fill', 'click', 'select_option', 'extract'), "
-        f"'selector' (XPath selector), and 'value' (value to use, if applicable). "
-        f"For the From field, use selector //*[@id=\"origin\"]/span/input, fill with 'Delhi', wait 1 second, and press Enter to select the autocomplete suggestion. "
-        f"For the To field, use selector //*[@id=\"destination\"]/span/input, fill with 'Jaipur', wait 1 second, and press Enter. "
-        f"Set date to '20-04-2025' using selector //*[@id=\"jDate\"]/span/input. "
-        f"Select '2A' class using selector //select[contains(@class, 'form-control')]. "
-        f"Click the search button using selector //button[@label='Find Trains']. "
-        f"Extract train data using 'action': 'extract' with a 'data' array of trains including "
-        f"'train_name', 'train_number', 'departure', 'arrival', 'availability'. "
-        f"Click 'Book Now' using selector //button[contains(@data-train-number, '')]. "
-        f"Include a 'queries' array answering: "
-        f"1. List all trains with departure and arrival times. "
-        f"2. Earliest departure train. "
-        f"3. Any train with available 2A seats. "
-        f"Example: "
-        f"{{\"actions\": [{{\"instruction\": \"Fill From\", \"action\": \"fill\", \"selector\": \"//*[@id=\\\"origin\\\"]/span/input\", \"value\": \"Delhi\"}}], "
-        f"\"queries\": [{{\"query\": \"List trains\", \"response\": \"...\"}}]}}"
-    )
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        page = await browser.new_page()
-        result = {"task": task, "status": "Failed", "details": "", "query_results": []}
+# === Extract Query Info ===
+async def extract_query_details(user_query: str, llm) -> dict:
+    today = datetime.today().date()
+    tomorrow = today + timedelta(days=1)
+    today_str = today.strftime("%Y-%m-%d")
+    tomorrow_str = tomorrow.strftime("%Y-%m-%d")
 
-        try:
-            # Navigate to IRCTC
-            logger.info("Navigating to IRCTC...")
-            await page.goto("https://www.irctc.co.in/nget/train-search", timeout=60000)
-            await page.wait_for_load_state("domcontentloaded", timeout=60000)
-            logger.info("Page loaded.")
+    prompt = f"""
+You are a smart assistant that extracts train booking info from natural language.
 
-            # Query DeepSeek
-            logger.info("Querying DeepSeek...")
-            response = query_ollama(prompt)
-            logger.debug(f"DeepSeek response: {response}")
-            if not response:
-                result["details"] = "Empty response from DeepSeek."
-                return result
+Query: "{user_query}"
 
-            # Parse actions and queries
-            try:
-                data = json.loads(response)
-                actions = data.get("actions", [])
-                query_results = data.get("queries", [])
-                logger.info(f"Parsed {len(actions)} actions and {len(query_results)} query results.")
-            except json.JSONDecodeError:
-                result["details"] = f"Invalid JSON from DeepSeek: {response}"
-                return result
+Return ONLY a valid JSON with the following keys:
+- source
+- destination
+- class
 
-            # Execute actions
-            for action_data in actions:
-                instruction = action_data.get("instruction", "")
-                action = action_data.get("action", "none")
-                selector = action_data.get("selector", "")
-                value = action_data.get("value", "")
+Rules:
+- Default class to "2A" if not mentioned.
+- Do NOT include "date" in the response.
+- Return ONLY valid JSON, no extra text or formatting.
 
-                logger.info(f"Executing: {instruction}")
+Example:
+{{
+  "source": "Kolkata",
+  "destination": "Mumbai",
+  "class": "3AC"
+}}
+"""
 
-                try:
-                    if action == "fill":
-                        await page.fill(selector, value)
-                        logger.info(f"Filled {selector} with {value}")
-                        if "From" in instruction or "To" in instruction:
-                            await page.wait_for_timeout(1000)
-                            await page.press(selector, "Enter")
-                            logger.info(f"Pressed Enter on {selector}")
-                    elif action == "click":
-                        await page.click(selector)
-                        logger.info(f"Clicked {selector}")
-                    elif action == "select_option":
-                        await page.select_option(selector, value=value)
-                        logger.info(f"Selected {value} in {selector}")
-                    elif action == "extract":
-                        result["train_data"] = action_data.get("data", [])
-                        logger.info(f"Extracted {len(result['train_data'])} trains")
-                    else:
-                        logger.warning(f"Unsupported action: {action}")
-                        continue
+    response = await llm.ainvoke(prompt)
+    try:
+        content = response.content if hasattr(response, "content") else str(response)
+        cleaned = re.sub(r"```(?:json|python)?", "", content).strip("` \n")
+        base_data = json.loads(cleaned)
 
-                    # Check for CAPTCHA
-                    if "search" in instruction.lower() or "book" in instruction.lower():
-                        captcha = await page.query_selector('img[src*="captcha"]')
-                        if captcha:
-                            logger.warning("CAPTCHA detected.")
-                            print("CAPTCHA detected. Solve it in the browser and press Enter in the terminal.")
-                            input("Solve the CAPTCHA and press Enter...")
-                            logger.info("CAPTCHA solved.")
+        lower_query = user_query.lower()
+        if "today" in lower_query:
+            base_data["date"] = today_str
+        else:
+            base_data["date"] = tomorrow_str
 
-                    await page.wait_for_load_state("networkidle", timeout=60000)
+        return base_data
+    except Exception as e:
+        print(f"❌ Failed to parse query details: {e}")
+        print("Raw response:", response)
+        return None
 
-                except PlaywrightTimeoutError as e:
-                    logger.error(f"Playwright TimeoutError for action '{instruction}' with selector '{selector}': {e}")
-                    print(f"Playwright Error: TimeoutError - Action '{instruction}' failed: {e}")
-                    result["details"] = f"TimeoutError for {instruction}: {e}"
-                    return result
-                except PlaywrightError as e:  # Fixed syntax here
-                    logger.error(f"Playwright Error for action '{instruction}' with selector '{selector}': {e}")
-                    print(f"Playwright Error: {e}")
-                    result["details"] = f"Error for {instruction}: {e}"
-                    return result
 
-            result["status"] = "Success"
-            result["details"] = f"Completed task. Extracted {len(result.get('train_data', []))} trains."
-            result["query_results"] = [
-                {"query": q["query"], "response": q["response"]}
-                for q in query_results
-            ]
+# === Main Agent Logic ===
+async def railway_agent(user_query: str):
+    print("\n🤖 Processing your query...")
 
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            print(f"Unexpected Error: {e}")
-            result["details"] = str(e)
-        finally:
-            await browser.close()
-            return result
+    # Using env var for security
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("❌ GEMINI_API_KEY not set. Please export it in your environment.")
 
-# Main function
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", api_key=api_key)
+
+    details = await extract_query_details(user_query, llm)
+    if not details:
+        print("⚠️ Could not extract travel details.")
+        return
+
+    source = details["source"]
+    destination = details["destination"]
+    travel_date = details["date"]
+    travel_class = details["class"]
+
+    print(f"🔍 Searching trains from {source} to {destination} on {travel_date} (Class: {travel_class})")
+
+    task = f"""
+    1. Open the IRCTC train search page: https://www.irctc.co.in/nget/train-search.
+    2. In the 'From' field, type '{source}' and select the appropriate station from the dropdown.
+    3. In the 'To' field, type '{destination}' and select the appropriate station from the dropdown.
+    4. Set the journey date to '{travel_date}'.
+    5. Use the controller action `select_travel_class` to select the travel class '{travel_class}'. (timeout: 5 seconds)
+    6. Click the 'Search' button and wait for the train list to load (timeout: 5 seconds).
+    7. Scroll to find the train results and click on the '{travel_class}' class fare option for each train.
+    8. Extract details and return the train availability in JSON format using the TrainAvailability model.
+    9. For every train returned, add "available": "yes" in the JSON.
+    10. If "No direct trains available between the inputted stations" pop-up message appears, end task and show message "no trains available" and skip the rest of the steps.
+    11. Ensure the output is a valid JSON object — do not escape or wrap in quotes. (timelimit: 15 seconds)
+"""
+
+    agent = Agent(task=task, controller=controller, llm=llm)
+    history = await agent.run()
+
+    result = history.final_result()
+    print("\n📋 Final Result:\n", result)
+
+    try:
+        with open("train_results.json", "w") as f:
+            json.dump(json.loads(result), f, indent=4)
+        print("✅ Results saved to train_results.json")
+    except Exception as e:
+        print("❌ Failed to save result:", e)
+
+
+# === CLI ===
 async def main():
-    print("🚆 Railway Booking Assistant 🚆")
-    print("Enter a task like: 'Book tickets from Delhi to Jaipur for 2A class on 2025-04-20'")
-    print("Type 'exit' to quit.")
+    print("🚆 Railway Assistant Ready!")
+    print("Ask something like: 'Find trains from Korba to Delhi tomorrow in 1AC'")
+    print("Type 'exit' to quit.\n")
 
     while True:
-        task = input("\nTask (or 'exit'): ")
-        if task.lower() in ["exit", "quit"]:
-            print("Goodbye!")
+        user_query = input("🧾 Query: ")
+        if user_query.lower() in ["exit", "quit"]:
+            print("👋 Bye!")
             break
+        await railway_agent(user_query)
 
-        task = f"{task}. Use the IRCTC website (https://www.irctc.co.in/nget/) to complete this task."
-        print("Processing...")
-        response = await deepseek_agent(task)
-        print("\nResults:")
-        print(json.dumps(response, indent=2))
 
 if __name__ == "__main__":
     asyncio.run(main())
